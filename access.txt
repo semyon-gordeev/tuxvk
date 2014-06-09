@@ -1,0 +1,7 @@
+https://oauth.vk.com/authorize?client_id=4381194&scope=messages,friends,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&response_type=token
+
+98109aac6a1aa0f0a3349002d5a5e8770f5c7bcc6ca03d5ac227d9264f23ba99695b94f42ab5798ef350d
+9f920c0240a6449dfbbe7c55ca8783677202d1327036737de50f26f25de7882c2e65d500db2d296ade15d
+---------------------------------------------------------------------------------------------------
+
+https://api.vk.com/method/friends.getOnline?user_id=32312071&order=hints&access_token=98109aac6a1aa0f0a3349002d5a5e8770f5c7bcc6ca03d5ac227d9264f23ba99695b94f42ab5798ef350d

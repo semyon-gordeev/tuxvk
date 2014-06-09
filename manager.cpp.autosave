@@ -1,0 +1,329 @@
+#include "manager.h"
+
+Manager::Manager(BaseObjectType* cobject, const Glib::RefPtr<Gtk::Builder>& builder):
+        Gtk::Window(cobject), _builder(builder)
+{
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    _builder->get_widget("search", _search);
+    _builder->get_widget("userListScroll", _userListScroll);
+    _builder->get_widget("messageViewer", _messageViewer);
+    _builder->get_widget("inputMessage", _inputMessage);
+    _builder->get_widget("logout", _logout);
+    _player = new Player(_builder);
+    _userListScroll->add(_userTreeView);
+    _refUserStore = Gtk::ListStore::create(userModel);
+    _userTreeView.set_model(_refUserStore);
+    initMessageBuffer();
+    searching = false;
+    //signals
+    _logout->signal_clicked().connect(sigc::mem_fun(*this, &Manager::logOut));
+    add_events(Gdk::KEY_RELEASE_MASK);
+    _inputMessage->signal_key_release_event().connect(sigc::mem_fun(*this, &Manager::sendMessage));
+    _inputMessage->signal_focus_in_event().connect(sigc::mem_fun(*this, &Manager::readMessage));
+    _search->signal_key_release_event().connect(sigc::mem_fun(*this, &Manager::searchContact));
+    Glib::RefPtr<Gtk::TreeSelection> refUserSelection = _userTreeView.get_selection();
+    refUserSelection->signal_changed().connect(sigc::mem_fun(*this, &Manager::selectUser));
+    authorize();
+
+    _connector = new Connector(_token);
+    _friends = _connector->getAllFriends();
+    _sort = _connector->getSortIdByHints();
+    _userTreeView.append_column("", userModel.name);
+    _userTreeView.append_column("", userModel.status);
+    _userListScroll->show_all_children();
+
+    connect();
+    exit = false;
+    _pollThread = thread(&Manager::waitNotification, this);
+}
+
+void Manager::destroyAuth(GtkWidget* widget, GtkWidget* window)
+{
+    gtk_main_quit();
+}
+
+gboolean Manager::closeWebView(WebKitWebView* webView, GtkWidget* window)
+{
+    gtk_widget_destroy(window);
+    return TRUE;
+}
+
+void Manager::loadFinish(WebKitWebView *web_view, WebKitWebFrame *web_frame, gpointer data) {
+        const char* uri = (const char*)webkit_web_view_get_uri(web_view);
+        if (const char* pos = strstr(uri, "#access_token=")) {
+            _token = string(pos+14, strstr(uri, "&expires_in"));
+            gtk_main_quit();
+        }
+}
+
+void Manager::authorize()
+{
+    GtkWidget *auth = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_default_size(GTK_WINDOW(auth), 660, 450);
+    WebKitWebView *webView = WEBKIT_WEB_VIEW(webkit_web_view_new());
+    GtkWidget *scrolledWindow = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolledWindow),
+            GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scrolledWindow), GTK_WIDGET(webView));
+
+    g_signal_connect(auth, "destroy", G_CALLBACK(&Manager::destroyAuth), NULL);
+    g_signal_connect(webView, "close-web-view", G_CALLBACK(&Manager::closeWebView), auth);
+    g_signal_connect(webView, "load-finished", G_CALLBACK(&Manager::loadFinish), NULL);
+
+    gtk_container_add(GTK_CONTAINER(auth), scrolledWindow);
+    webkit_web_view_load_uri(webView, "https://oauth.vk.com/authorize?client_id=4381194&scope=friends,messages,"\
+                             "offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&response_type=token");
+    gtk_widget_grab_focus(GTK_WIDGET(webView));
+    gtk_widget_show_all(auth);
+    gtk_main();
+}
+
+
+void Manager::logOut()
+{
+    std::cout<<"logout"<<std::endl;
+
+}
+
+bool Manager::searchContact(GdkEventKey *event)
+{
+    if (!_search->get_text().size()) {
+        searching = false;
+        _refUserStore->clear();
+        connect();
+    }
+    if ((event->keyval == 65421 || event->keyval == 65293) && _search->get_text().size()) {
+        searching = true;
+        _refUserStore->clear();
+        vector<int> listSearch;
+        const char *s = _search->get_text().c_str();
+        for (int i: _sort) {
+            const char *user = _friends[i].name.c_str();
+            if (strstr(user, s))
+                listSearch.push_back(i);
+        }
+        userOnline(listSearch, false);
+    }
+    return false;
+}
+
+
+bool Manager::sendMessage(GdkEventKey *event)
+{
+    if ((event->keyval == 65421 || event->keyval == 65293) && _current) {
+        Glib::RefPtr<Gtk::TextBuffer> buf = _inputMessage->get_buffer();
+        vector<Message> list;
+        Message m;
+        m.body = buf->get_text();
+        m.out = 1;
+        m.date = time(0);
+        string s(buf->get_text());
+        s = s.substr(0, s.length()-1);
+        if (!_connector->sendMessage("messages.send", "user_id="+to_string(_current)+"&message="+s))
+            m.body += "\t\t[Error! Message didn`t send.]";
+        list.push_back(m);
+        addMessagesInBuffer(list);
+        buf->set_text("");
+    }
+    return false;
+}
+
+void Manager::connect()
+{
+    vector<int> onlineUsersList;
+    std::map<int, int> unreadMessageList;
+    for (int i: _sort)
+        if (_friends[i].unread)
+            unreadMessageList[i] = _friends[i].unread;
+        else if (_friends[i].online)
+            onlineUsersList.push_back(i);
+    userOnline(onlineUsersList, false);
+    inputMessageFrom(unreadMessageList, false);
+}
+//---------------------------------------------------------------------
+void Manager::userOnline(vector<int> ids, bool change)
+{  
+    changeUserStore.lock();
+    for(int i: ids) {
+        if (change)
+            _friends[i].online = true;
+        Gtk::TreeModel::Row row = *(_refUserStore->append());
+        row[userModel.name] = _friends[i].name;
+        row[userModel.id] = i;
+        row[userModel.status] = _friends[i].online ? "●" : "";
+    }
+    changeUserStore.unlock();
+}
+
+void Manager::userOffline(vector<int> ids)
+{
+    changeUserStore.lock();
+    for (int i: ids) {
+        _friends[i].online = false;
+        for (Gtk::ListStore::iterator t: _refUserStore->children()) {
+            Gtk::TreeModel::Row row = *t;
+            if (i == row[userModel.id]) {
+                _refUserStore->erase(t);
+                break;
+            }
+        }
+    }
+    changeUserStore.unlock();
+}
+
+void Manager::inputMessageFrom(std::map<int, int> unread, bool change)
+{
+    changeUserStore.lock();
+    for (pair<int,int> i: unread) {
+        if (change)
+            _friends[i.first].unread += i.second;
+        if (i.first==_current) {
+            addMessagesInBuffer(_connector->getDialogWithUser(i.first, i.second));
+            for (Gtk::ListStore::iterator t: _refUserStore->children()) {
+                Gtk::TreeModel::Row row = *t;
+                if (_current == row[userModel.id]) {
+                    row[userModel.status] = to_string(_friends[i.first].unread);
+                    break;
+                }
+            }
+        }
+        else {
+            Gtk::TreeModel::Row row = *(_refUserStore->prepend());
+            row[userModel.name] = _friends[i.first].name;
+            row[userModel.id] = i.first;
+            row[userModel.status] = to_string(_friends[i.first].unread);
+        }
+    }
+    changeUserStore.unlock();
+
+}
+
+//----------------------------------------------------------
+void Manager::selectUser()
+{
+    if (!_friends[_current].online && _friends[_current].unread==0 && _current && !searching) {
+        vector<int> v = {_current};
+        userOffline(v);
+    }
+    Glib::RefPtr<Gtk::TreeSelection> refUserSelection = _userTreeView.get_selection();
+    Gtk::TreeModel::iterator iter = refUserSelection->get_selected();
+    Gtk::TreeModel::Row row = *iter;
+    _current = row[userModel.id];
+    vector<Message> messages = _connector->getDialogWithUser(_current);
+    initMessageBuffer();
+    addMessagesInBuffer(messages);
+}
+
+void Manager::addMessagesInBuffer(vector<Message> messages)
+{
+    for (vector<struct Message>::reverse_iterator i=messages.rbegin(); i!=messages.rend(); ++i) {
+        Glib::ustring tag;
+        if (i < messages.rend()-_friends[_current].unread)
+            tag = "none";
+        else
+            tag = "unread";
+        if (i == messages.rend()-_friends[_current].unread)
+            _unreadMark = _messageBuffer->create_mark(_messageBuffer->end());
+        char date[20];
+        strftime(date, sizeof(date), "[%e %b %R]", localtime(&(i->date)));
+        Glib::ustring buf(date);
+        _messageBuffer->insert_with_tag(_messageBuffer->end(), buf, tag);
+        if (i->out == 1)
+            buf = " Я: ";
+        else
+            buf = " "+ _friends[_current].name+": ";
+        Glib::RefPtr<Gtk::TextBuffer::Mark> refMark = _messageBuffer->create_mark(_messageBuffer->end());
+        _messageBuffer->insert_with_tag(_messageBuffer->end(), buf, tag);
+        _messageBuffer->apply_tag_by_name("name", refMark->get_iter(), _messageBuffer->end());
+        buf = i->body + "\n";
+        _messageBuffer->insert_with_tag(_messageBuffer->end(), buf, tag);
+    }
+     Glib::RefPtr<Gtk::TextBuffer::Mark> r = _messageBuffer->create_mark(_messageBuffer->end());;
+    _messageViewer->scroll_to(r);
+}
+
+void Manager::initMessageBuffer()
+{
+    Glib::RefPtr<Gtk::TextBuffer::Tag> refTag1 = Gtk::TextBuffer::Tag::create("unread");
+    refTag1->property_background() = "grey";
+    Glib::RefPtr<Gtk::TextBuffer::Tag> refTag2 = Gtk::TextBuffer::Tag::create("name");
+    refTag2->property_weight() = 1500;
+    refTag2->property_foreground() = "green";
+    Glib::RefPtr<Gtk::TextBuffer::Tag> refTag3 = Gtk::TextBuffer::Tag::create("none");
+    Glib::RefPtr<Gtk::TextBuffer::TagTable> refTagTable = Gtk::TextBuffer::TagTable::create();
+    refTagTable->add(refTag1);
+    refTagTable->add(refTag2);
+    refTagTable->add(refTag3);
+    _messageBuffer = Gtk::TextBuffer::create(refTagTable);
+    _messageViewer->set_buffer(_messageBuffer);
+}
+
+bool Manager::readMessage(GdkEventFocus *event)
+{
+    if (_friends[_current].unread == 0)
+        return false;
+    _connector->request("messages.markAsRead", "user_id="+to_string(_current));
+    _friends[_current].unread = 0;
+    _messageBuffer->remove_tag_by_name("unread", _unreadMark->get_iter(), _messageBuffer->end());
+    _unreadMark = _messageBuffer->create_mark(_messageBuffer->end());
+    Glib::RefPtr<Gtk::TreeSelection> refUserSelection = _userTreeView.get_selection();
+    Gtk::TreeModel::iterator iter = refUserSelection->get_selected();
+    Gtk::TreeModel::Row row = *iter;
+    if (_friends[_current].online)
+        row[userModel.status] = "+";
+    else
+        row[userModel.status] = "";
+    return false;
+}
+
+int Manager::waitNotification()
+{
+    _longPoll = new LongPoll(_token);
+    _longPoll->init();
+    while (true) {
+        std::map<int, vector<int>> ans;
+        ans = _longPoll->request();
+        if (ans.size()) {
+            vector<int> outUser, inUser;
+            std::map<int, int> mesUser;
+            //message
+            for(int i: ans[4]) {
+                if (_friends[i].online && i!=_current)
+                    outUser.push_back(i);
+                if (mesUser.find(i)==mesUser.end())
+                    mesUser[i] = 1;
+                else
+                    mesUser[i] += 1;
+            }
+            //user online
+            for (int i: ans[8])
+                if (!_friends[i].online) {
+                    inUser.push_back(i);
+                    _friends[i].online = true;
+                }
+            //user offline
+            for (int i: ans[9])
+                if (_friends[i].online) {
+                    outUser.push_back(i);
+                    _friends[i].online = false;
+                }
+            userOnline(inUser, true);
+            userOffline(outUser);
+            inputMessageFrom(mesUser, true);
+        }
+    }
+    if (exit)
+        return 0;
+}
+
+
+Manager::~Manager()
+{
+    cout<<"exit";
+    exit = true;
+    //_pollThread.join();
+    curl_global_cleanup();
+    delete _player;
+    delete _connector;
+    delete _longPoll;
+}
